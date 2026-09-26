@@ -236,8 +236,7 @@ jobs:
             echo "Creating release $TAG"
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "Gamescope ${GAMESCOPE_TAG} (Clang x86-64-v4) (${TAG})" \
-              --generate-notes \
+              --title "Gamescope ${GAMESCOPE_TAG} (Clang x86-64-v4)" \
               --latest \
               ./*.deb
           fi
