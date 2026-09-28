@@ -117,21 +117,17 @@ jobs:
             echo "OK: glm converted to dependency"
           fi
 
-      - name: Patch debian/rules
+      - name: Copy debian/rules from repo
         working-directory: gamescope
         run: |
-          # Replace GCC-specific configuration with Clang + optimization flags
-          # The original rules use dh_auto_configure with -Dpipewire=enabled etc.
-          # We add CFLAGS/CXXFLAGS via environment and override the configure step.
+          # Use our own debian/rules to build with Clang + LLD,
+          # disable OpenVR support, and skip dh_dwz (Clang DWARF-5).
+          # CFLAGS/CXXFLAGS are passed via env in the build step.
 
-          cp ../.github/helpers/rules debian/
-
+          cp ../.github/helpers/rules debian/rules
           chmod +x debian/rules
 
-          sed -i "s|^export DEB_CFLAGS_MAINT_APPEND = .*|export DEB_CFLAGS_MAINT_APPEND = ${{ matrix.flags }}|" debian/rules
-          sed -i "s|^export DEB_CXXFLAGS_MAINT_APPEND = .*|export DEB_CXXFLAGS_MAINT_APPEND = ${{ matrix.flags }}|" debian/rules
-
-          echo "--- Patched debian/rules ---"
+          echo "--- debian/rules ---"
           cat debian/rules
 
       - name: Build .deb package
@@ -142,6 +138,12 @@ jobs:
           DEB_CFLAGS_MAINT_APPEND: ${{ matrix.flags }}
           DEB_CXXFLAGS_MAINT_APPEND: ${{ matrix.flags }}
         run: |
+          echo "=== Effective CFLAGS ==="
+          dpkg-buildflags --get CFLAGS
+          echo "=== Effective CXXFLAGS ==="
+          dpkg-buildflags --get CXXFLAGS
+          echo "==="
+
           # Clean any previous build
           dh_clean || true
           rm -rf obj-* || true
@@ -170,7 +172,7 @@ jobs:
 
       - name: Make archive
         run: |
-          tar -caf "gamescope-${TAG}-x86-64-${{ matrix.ver }}.tar.zst" "packages"
+          tar -caf "gamescope-${GAMESCOPE_TAG}-x86-64-${{ matrix.ver }}.tar.zst" "packages"
 
       - name: Upload .deb packages as artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -207,7 +209,7 @@ jobs:
           FLAGS=(--latest)
           [[ $DRAFT = true ]] && FLAGS=(--draft)
 
-          TITLE="Gamescope ${GAMESCOPE_TAG} (Clang x86-64-v3/v4) (${TAG})"
+          TITLE="Gamescope ${GAMESCOPE_TAG} (${TAG})"
           [[ $DRAFT = true ]] && TITLE="[DRAFT] $TITLE"
 
           ls -lh artifacts/
