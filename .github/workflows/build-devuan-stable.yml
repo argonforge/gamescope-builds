@@ -168,11 +168,15 @@ jobs:
             exit 1
           fi
 
+      - name: Make archive
+        run: |
+          tar -caf "gamescope-${TAG}-x86-64-${{ matrix.ver }}.tar.zst" "packages"
+
       - name: Upload .deb packages as artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gamescope-deb-packages-${{ matrix.ver }}
-          path: packages/*.deb
+          path: ./*.zst
           retention-days: ${{ env.DRAFT == 'true' && 1 || 5 }}
 
       - name: Show ccache stats
@@ -213,7 +217,7 @@ jobs:
             gh release upload "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --clobber \
-              artifacts/*.deb
+              artifacts/*.zst
           else
             echo "Creating release $TAG"
             gh release create "$TAG" \
@@ -222,5 +226,5 @@ jobs:
               --title "$TITLE" \
               --notes-file .github/release-notes.md \
               "${FLAGS[@]}" \
-              artifacts/*.deb
+              artifacts/*.zst
           fi
