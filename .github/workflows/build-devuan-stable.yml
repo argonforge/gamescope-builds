@@ -209,7 +209,7 @@ jobs:
           FLAGS=(--latest)
           [[ $DRAFT = true ]] && FLAGS=(--draft)
 
-          TITLE="Gamescope ${GAMESCOPE_TAG} (${TAG})"
+          TITLE="Gamescope ${GAMESCOPE_TAG} (Clang)"
           [[ $DRAFT = true ]] && TITLE="[DRAFT] $TITLE"
 
           ls -lh artifacts/
