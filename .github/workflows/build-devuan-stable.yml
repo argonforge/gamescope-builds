@@ -138,6 +138,16 @@ jobs:
           DEBEMAIL: postmaster@itvault.info
           DEBFULLNAME: Argon Forge Gamescope workflow
         run: |
+          if [ ! -f debian/changelog ]; then
+            echo "ERROR: debian/changelog not found in $(pwd)"
+            exit 1
+          fi
+
+          CURRENT_VER=$(dpkg-parsechangelog -S Version)
+            if [ -z "$CURRENT_VER" ]; then
+              echo "ERROR: could not parse current version from debian/changelog"
+              exit 1
+          fi
           CURRENT_VER=$(dpkg-parsechangelog -S Version)
           NEW_VER="${CURRENT_VER}+${{ matrix.isa }}"
           echo "Original version: ${CURRENT_VER}"
@@ -201,6 +211,7 @@ jobs:
 
   publish:
     needs: build
+    if: ${{ env.DRAFT != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
