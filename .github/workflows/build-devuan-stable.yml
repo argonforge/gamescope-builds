@@ -29,7 +29,10 @@ concurrency:
 
 jobs:
   build:
+    # Single runner, so run after build i386. Do not parallelize
+    needs: build-i386
     strategy:
+      fail-fast: true
       matrix:
         include:
           - ver: v3
@@ -40,12 +43,14 @@ jobs:
             isa: avx512
     runs-on: self-hosted
     timeout-minutes: 45
-    container:
-      image: nafigat0r/devuan:6-dev
     env:
-      CCACHE_DIR: /__w/${{ github.event.repository.name }}/${{ github.event.repository.name }}/.ccache-${{ matrix.ver }}
+      IMAGE: nafigat0r/devuan:6-dev
+      WORKDIR: /work
+      HOST_CCACHE_DIR: "${{ github.workspace }}/.ccache-gamescope-${{ matrix.ver }}"
+      CCACHE_DIR: "/work/.ccache-gamescope-${{ matrix.ver }}"
       CCACHE_MAXSIZE: 2G
       CCACHE_COMPRESS: 'true'
+      CCACHE_COMPRESSLEVEL: '6'
     steps:
       - name: Compute version variables
         run: |
@@ -53,146 +58,190 @@ jobs:
           echo "GAMESCOPE_TAG=$GAMESCOPE_TAG" >> $GITHUB_ENV
           echo "Using GAMESCOPE_TAG=$GAMESCOPE_TAG"
 
+      - name: Fix workspace ownership
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            --user 0:0 \
+            "$IMAGE" chown -R $(id -u):$(id -g) "${{ env.WORKDIR }}"
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          set-safe-directory: false
 
       - name: Restore ccache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.CCACHE_DIR }}
+          path: ${{ env.HOST_CCACHE_DIR }}
           key: ccache-gamescope-${{ matrix.ver }}-${{ github.sha }}
           restore-keys: |
             ccache-gamescope-${{ matrix.ver }}-
 
-      - name: Configure ccache
+      - name: Download Debian packaging and clone source
         run: |
-          mkdir -p "$CCACHE_DIR"
-          ccache --max-size="$CCACHE_MAXSIZE"
-          ccache --set-config=compression=true
-          ccache --set-config=compression_level=6
-          ccache -s
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            -e HOME=/tmp \
+            -e GAMESCOPE_TAG="${{ env.GAMESCOPE_TAG }}" \
+            -w "${{ env.WORKDIR }}" \
+            "$IMAGE" bash -c '
+              set -e
 
-      - name: Download Debian packaging
-        run: |
-          mkdir -p /tmp/gamescope-debian
-          cd /tmp/gamescope-debian
-          wget -q --show-progress \
-            "http://ftp.debian.org/debian/pool/contrib/g/gamescope/gamescope_${GAMESCOPE_TAG}+ds-1~bpo13+1.debian.tar.xz" \
-            -O gamescope-debian.tar.xz || \
-          { echo "Could not download Debian packaging for ${GAMESCOPE_TAG}"; exit 1; }
-          tar xf gamescope-debian.tar.xz
-          echo "Debian packaging extracted:"
-          ls -la debian/
+              mkdir -p /tmp/gamescope-debian
+              cd /tmp/gamescope-debian
 
-      - name: Clone Gamescope source
-        run: |
-          rm -rf gamescope
-          git clone --depth 1 --branch "${GAMESCOPE_TAG}" \
-            https://github.com/ValveSoftware/gamescope.git gamescope
-          cd gamescope
-          git submodule update --init --recursive
-          echo "Gamescope source at tag: ${GAMESCOPE_TAG}"
+              wget -q --show-progress \
+                "http://ftp.debian.org/debian/pool/contrib/g/gamescope/gamescope_${GAMESCOPE_TAG}+ds-1~bpo13+1.debian.tar.xz" \
+                -O gamescope-debian.tar.xz || { \
+                  echo "Could not download Debian packaging for ${GAMESCOPE_TAG}"; \
+                  exit 1; \
+                }
 
-      - name: Copy Debian packaging
-        run: |
-          cp -r /tmp/gamescope-debian/debian gamescope/
-          ls -la gamescope/debian/
+              tar xf gamescope-debian.tar.xz
+              echo "Debian packaging extracted:"
+              ls -la debian/
+
+              cd /work
+              rm -rf gamescope
+              git clone --depth 1 --branch "${GAMESCOPE_TAG}" \
+                https://github.com/ValveSoftware/gamescope.git gamescope
+              cd gamescope
+              git submodule update --init --recursive
+              echo "Gamescope source at tag: ${GAMESCOPE_TAG}"
+
+              cp -r /tmp/gamescope-debian/debian debian
+              ls -la debian/
+            '
 
       - name: Apply Debian patches
-        working-directory: gamescope
         run: |
-          if [ ! -d debian/patches ]; then
-            echo "ERROR: debian/patches not found - cannot proceed"
-            exit 1
-          fi
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            -e HOME=/tmp \
+            -w "${{ env.WORKDIR }}/gamescope" \
+            "$IMAGE" bash -c '
+              if [ ! -d debian/patches ]; then
+                echo "ERROR: debian/patches not found - cannot proceed"
+                exit 1
+              fi
 
-          export QUILT_PATCHES=debian/patches
-          quilt push -a
+              export QUILT_PATCHES=debian/patches
+              quilt push -a
 
-          echo "--- Applied patches ---"
-          quilt applied
+              echo "--- Applied patches ---"
+              quilt applied
 
-          # Verify that the glm/stb patch was applied
-          if grep -q "subproject('glm')" meson.build; then
-            echo "WARNING: glm is still a subproject - patch may not have applied"
-          else
-            echo "OK: glm converted to dependency"
-          fi
+              if grep -qE "subproject\(.glm.\)" meson.build; then
+                echo "WARNING: glm is still a subproject - patch may not have applied"
+              else
+                echo "OK: glm converted to dependency"
+              fi
+            '
 
       - name: Copy debian/rules from repo
-        working-directory: gamescope
         run: |
-          # Use our own debian/rules to build with Clang + LLD,
-          # disable OpenVR support, and skip dh_dwz (Clang DWARF-5).
-          # CFLAGS/CXXFLAGS are passed via env in the build step.
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            -e HOME=/tmp \
+            -w "${{ env.WORKDIR }}/gamescope" \
+            "$IMAGE" bash -c '
+              # Use our own debian/rules to build with Clang + LLD,
+              # disable OpenVR support, and skip dh_dwz (Clang DWARF-5).
+              # CFLAGS/CXXFLAGS are passed via DEB_CFLAGS_MAINT_APPEND / DEB_CXXFLAGS_MAINT_APPEND env vars.
 
-          cp ../.github/helpers/rules debian/rules
-          chmod +x debian/rules
+              cp ../.github/helpers/rules debian/rules
+              chmod +x debian/rules
 
-          echo "--- debian/rules ---"
-          cat debian/rules
+              echo "--- debian/rules ---"
+              cat debian/rules
+            '
 
       - name: Bump package version with ISA suffix
-        working-directory: gamescope
-        env:
-          DEBEMAIL: postmaster@itvault.info
-          DEBFULLNAME: Argon Forge Gamescope workflow
         run: |
-          if [ ! -f debian/changelog ]; then
-            echo "ERROR: debian/changelog not found in $(pwd)"
-            exit 1
-          fi
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            -e HOME=/tmp \
+            -e DEBEMAIL=postmaster@itvault.info \
+            -e DEBFULLNAME="Argon Forge Gamescope workflow" \
+            -w "${{ env.WORKDIR }}/gamescope" \
+            "$IMAGE" bash -c '
+              if [ ! -f debian/changelog ]; then
+                echo "ERROR: debian/changelog not found"
+                exit 1
+              fi
 
-          CURRENT_VER=$(dpkg-parsechangelog -S Version)
-            if [ -z "$CURRENT_VER" ]; then
-              echo "ERROR: could not parse current version from debian/changelog"
-              exit 1
-          fi
-          CURRENT_VER=$(dpkg-parsechangelog -S Version)
-          NEW_VER="${CURRENT_VER}+${{ matrix.isa }}"
-          echo "Original version: ${CURRENT_VER}"
-          echo "New version: ${NEW_VER}"
-          dch --newversion "$NEW_VER" "Rebuild with ${{ matrix.isa }} optimizations"
+              CURRENT_VER=$(dpkg-parsechangelog -S Version)
+              if [ -z "$CURRENT_VER" ]; then
+                echo "ERROR: could not parse current version from debian/changelog"
+                exit 1
+              fi
+
+              export SOURCE_DATE_EPOCH=$(dpkg-parsechangelog -S Timestamp)
+
+              NEW_VER="${CURRENT_VER}+${{ matrix.isa }}"
+              echo "Original version: ${CURRENT_VER}"
+              echo "New version: ${NEW_VER}"
+              dch --newversion "$NEW_VER" "Rebuild with ${{ matrix.isa }} optimizations"
+            '
 
       - name: Build .deb package
-        working-directory: gamescope
-        env:
-          CC: ccache clang
-          CXX: ccache clang++
-          DEB_CFLAGS_MAINT_APPEND: ${{ matrix.flags }}
-          DEB_CXXFLAGS_MAINT_APPEND: ${{ matrix.flags }}
         run: |
-          echo "=== Effective CFLAGS ==="
-          dpkg-buildflags --get CFLAGS
-          echo "=== Effective CXXFLAGS ==="
-          dpkg-buildflags --get CXXFLAGS
-          echo "==="
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            -e CCACHE_DIR="${{ env.CCACHE_DIR }}" \
+            -e CCACHE_MAXSIZE \
+            -e CCACHE_COMPRESS \
+            -e CCACHE_COMPRESSLEVEL \
+            -e HOME=/tmp \
+            -e CC="ccache clang" \
+            -e CXX="ccache clang++" \
+            -e DEB_CFLAGS_MAINT_APPEND="${{ matrix.flags }}" \
+            -e DEB_CXXFLAGS_MAINT_APPEND="${{ matrix.flags }}" \
+            -e DEB_BUILD_OPTIONS="noautodbgsym noddebs parallel=$(nproc)" \
+            -w "${{ env.WORKDIR }}/gamescope" \
+            "$IMAGE" bash -c '
+              # clang-19 installs /usr/lib/llvm-19/bin/clang; make it discoverable
+              export PATH="/usr/lib/llvm-19/bin:$PATH"
 
-          # Clean any previous build
-          dh_clean || true
-          rm -rf obj-* || true
+              echo "=== Effective CFLAGS ==="
+              dpkg-buildflags --get CFLAGS
+              echo "=== Effective CXXFLAGS ==="
+              dpkg-buildflags --get CXXFLAGS
+              echo "==="
 
-          # Verify ccache sees the compilers
-          ccache --version | head -1
-          ccache -s
+              # Clean any previous build
+              dh_clean || true
+              rm -rf obj-* || true
 
-          # Build only binary package, no source, no signing
-          export DEB_BUILD_OPTIONS="noautodbgsym noddebs parallel=$(nproc)"
-          dpkg-buildpackage -b -us -uc
+              # Verify ccache sees the compilers
+              ccache --version | head -1
+              ccache -s
 
-          echo "--- .deb files in parent directory ---"
-          ls -lh ../*.deb || echo "No .deb files found"
+              # Build only binary package, no source, no signing
+              dpkg-buildpackage -b -us -uc
+
+              echo "--- .deb files in parent directory ---"
+              ls -lh ../*.deb || echo "No .deb files found"
+            '
 
       - name: Collect packages
         run: |
           mkdir -p packages
           find . -maxdepth 1 -name '*.deb' ! -name '*dbgsym*' ! -name '*ddeb*' -exec mv {} packages/ \;
-          echo "--- packages/ contents ---"
-          ls -lh packages/
+
           if [ -z "$(ls -A packages/)" ]; then
             echo "ERROR: packages/ is empty - dpkg-buildpackage produced no .deb"
             exit 1
           fi
+
+          echo "--- packages/ contents ---"
+          ls -lh packages/
 
       - name: Make archive
         run: |
@@ -207,11 +256,257 @@ jobs:
 
       - name: Show ccache stats
         if: always()
-        run: ccache -s
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            -e CCACHE_DIR="${{ env.CCACHE_DIR }}" \
+            -e CCACHE_MAXSIZE \
+            -e CCACHE_COMPRESS \
+            -e CCACHE_COMPRESSLEVEL \
+            -e HOME=/tmp \
+            "$IMAGE" ccache -s || true
+
+  build-i386:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - ver: v3
+            flags: -march=i686 -mtune=znver3 -mavx2 -mfma -mbmi -mbmi2 -mf16c -mmovbe ${{ vars.FLAGS }}
+            isa: avx2
+          - ver: v4
+            flags: -march=i686 -mtune=znver4 -mavx2 -mfma -mbmi -mbmi2 -mf16c -mmovbe -mavx512f -mavx512bw -mavx512cd -mavx512dq -mavx512vl ${{ vars.FLAGS }}
+            isa: avx512
+    runs-on: self-hosted
+    timeout-minutes: 40
+    env:
+      IMAGE: nafigat0r/devuan:6-dev-i386
+      WORKDIR: /work
+      HOST_CCACHE_DIR: "${{ github.workspace }}/.ccache-gamescope-i386-${{ matrix.ver }}"
+      CCACHE_DIR: "/work/.ccache-gamescope-i386-${{ matrix.ver }}"
+      CCACHE_MAXSIZE: 2G
+      CCACHE_COMPRESS: 'true'
+      CCACHE_COMPRESSLEVEL: '6'
+    steps:
+      - name: Compute version variables
+        run: |
+          GAMESCOPE_TAG="${TAG#v}"
+          echo "GAMESCOPE_TAG=$GAMESCOPE_TAG" >> $GITHUB_ENV
+          echo "Using GAMESCOPE_TAG=$GAMESCOPE_TAG"
+
+      - name: Fix workspace ownership
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            --user 0:0 \
+            "$IMAGE" chown -R $(id -u):$(id -g) "${{ env.WORKDIR }}"
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          set-safe-directory: false
+
+      - name: Restore ccache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.HOST_CCACHE_DIR }}
+          key: ccache-gamescope-i386-${{ matrix.ver }}-${{ github.sha }}
+          restore-keys: |
+            ccache-gamescope-i386-${{ matrix.ver }}-
+
+      - name: Download Debian packaging and clone source
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            -e HOME=/tmp \
+            -e GAMESCOPE_TAG="${{ env.GAMESCOPE_TAG }}" \
+            -w "${{ env.WORKDIR }}" \
+            "$IMAGE" bash -c '
+              set -e
+
+              mkdir -p /tmp/gamescope-debian
+              cd /tmp/gamescope-debian
+
+              wget -q --show-progress \
+                "http://ftp.debian.org/debian/pool/contrib/g/gamescope/gamescope_${GAMESCOPE_TAG}+ds-1~bpo13+1.debian.tar.xz" \
+                -O gamescope-debian.tar.xz || { \
+                  echo "Could not download Debian packaging for ${GAMESCOPE_TAG}"; \
+                  exit 1; \
+                }
+
+              tar xf gamescope-debian.tar.xz
+              echo "Debian packaging extracted:"
+              ls -la debian/
+
+              cd /work
+              rm -rf gamescope
+              git clone --depth 1 --branch "${GAMESCOPE_TAG}" \
+                https://github.com/ValveSoftware/gamescope.git gamescope
+              cd gamescope
+              git submodule update --init --recursive
+              echo "Gamescope source at tag: ${GAMESCOPE_TAG}"
+
+              cp -r /tmp/gamescope-debian/debian debian
+              ls -la debian/
+            '
+
+      - name: Apply Debian patches
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            -e HOME=/tmp \
+            -w "${{ env.WORKDIR }}/gamescope" \
+            "$IMAGE" bash -c '
+              if [ ! -d debian/patches ]; then
+                echo "ERROR: debian/patches not found - cannot proceed"
+                exit 1
+              fi
+
+              export QUILT_PATCHES=debian/patches
+              quilt push -a
+
+              echo "--- Applied patches ---"
+              quilt applied
+
+              if grep -qE "subproject\(.glm.\)" meson.build; then
+                echo "WARNING: glm is still a subproject - patch may not have applied"
+              else
+                echo "OK: glm converted to dependency"
+              fi
+            '
+
+      - name: Copy debian/rules from repo
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            -e HOME=/tmp \
+            -w "${{ env.WORKDIR }}/gamescope" \
+            "$IMAGE" bash -c '
+              # Use our own debian/rules to build with Clang + LLD,
+              # disable OpenVR support, and skip dh_dwz (Clang DWARF-5).
+              # CFLAGS/CXXFLAGS are passed via DEB_CFLAGS_MAINT_APPEND / DEB_CXXFLAGS_MAINT_APPEND env vars.
+
+              cp ../.github/helpers/rules debian/rules
+              chmod +x debian/rules
+
+              echo "--- debian/rules ---"
+              cat debian/rules
+            '
+
+      - name: Bump package version with ISA suffix
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            -e HOME=/tmp \
+            -e DEBEMAIL=postmaster@itvault.info \
+            -e DEBFULLNAME="Argon Forge Gamescope workflow" \
+            -w "${{ env.WORKDIR }}/gamescope" \
+            "$IMAGE" bash -c '
+              if [ ! -f debian/changelog ]; then
+                echo "ERROR: debian/changelog not found"
+                exit 1
+              fi
+
+              CURRENT_VER=$(dpkg-parsechangelog -S Version)
+              if [ -z "$CURRENT_VER" ]; then
+                echo "ERROR: could not parse current version from debian/changelog"
+                exit 1
+              fi
+
+              export SOURCE_DATE_EPOCH=$(dpkg-parsechangelog -S Timestamp)
+
+              NEW_VER="${CURRENT_VER}+${{ matrix.isa }}"
+              echo "Original version: ${CURRENT_VER}"
+              echo "New version: ${NEW_VER}"
+              dch --newversion "$NEW_VER" "Rebuild with ${{ matrix.isa }} optimizations"
+            '
+
+      - name: Build .deb package
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            -e CCACHE_DIR="${{ env.CCACHE_DIR }}" \
+            -e CCACHE_MAXSIZE \
+            -e CCACHE_COMPRESS \
+            -e CCACHE_COMPRESSLEVEL \
+            -e HOME=/tmp \
+            -e CC="ccache clang" \
+            -e CXX="ccache clang++" \
+            -e DEB_CFLAGS_MAINT_APPEND="${{ matrix.flags }}" \
+            -e DEB_CXXFLAGS_MAINT_APPEND="${{ matrix.flags }}" \
+            -e DEB_BUILD_OPTIONS="noautodbgsym noddebs parallel=$(nproc)" \
+            -w "${{ env.WORKDIR }}/gamescope" \
+            "$IMAGE" bash -c '
+              # clang-19 installs /usr/lib/llvm-19/bin/clang; make it discoverable
+              export PATH="/usr/lib/llvm-19/bin:$PATH"
+
+              echo "=== Effective CFLAGS ==="
+              dpkg-buildflags --get CFLAGS
+              echo "=== Effective CXXFLAGS ==="
+              dpkg-buildflags --get CXXFLAGS
+              echo "==="
+
+              # Clean any previous build
+              dh_clean || true
+              rm -rf obj-* || true
+
+              # Verify ccache sees the compilers
+              ccache --version | head -1
+              ccache -s
+
+              # Build only binary package, no source, no signing
+              dpkg-buildpackage -b -us -uc
+
+              echo "--- .deb files in parent directory ---"
+              ls -lh ../*.deb || echo "No .deb files found"
+            '
+
+      - name: Collect packages
+        run: |
+          mkdir -p packages
+          find . -maxdepth 1 -name '*.deb' ! -name '*dbgsym*' ! -name '*ddeb*' -exec mv {} packages/ \;
+
+          if [ -z "$(ls -A packages/)" ]; then
+            echo "ERROR: packages/ is empty - dpkg-buildpackage produced no .deb"
+            exit 1
+          fi
+
+          echo "--- packages/ contents ---"
+          ls -lh packages/
+
+      - name: Make archive
+        run: |
+          tar -caf "gamescope-${GAMESCOPE_TAG}-i386-${{ matrix.ver }}.tar.zst" "packages"
+
+      - name: Upload .deb packages as artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gamescope-deb-packages-i386-${{ matrix.ver }}
+          path: ./*.zst
+          retention-days: ${{ env.DRAFT == 'true' && 1 || 5 }}
+
+      - name: Show ccache stats
+        if: always()
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:${{ env.WORKDIR }}" \
+            -e CCACHE_DIR="${{ env.CCACHE_DIR }}" \
+            -e CCACHE_MAXSIZE \
+            -e CCACHE_COMPRESS \
+            -e CCACHE_COMPRESSLEVEL \
+            -e HOME=/tmp \
+            "$IMAGE" ccache -s || true
 
   publish:
-    needs: build
-    if: ${{ env.DRAFT != 'true' }}
+    needs: [build, build-i386]
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -261,8 +556,14 @@ jobs:
           mkdir -p apt-repo/conf
           cp .github/helpers/distributions apt-repo/conf/distributions
 
-          reprepro -Vb apt-repo -C main -A amd64 includedeb stable-avx2 build/gamescope_*+avx2_amd64.deb
-          reprepro -Vb apt-repo -C main -A amd64 includedeb stable-avx512 build/gamescope_*+avx512_amd64.deb
+          for arch in amd64 i386; do
+            for codename in stable-avx2 stable-avx512; do
+              for deb in build/*+${codename#stable-}_${arch}.deb; do
+                [ -f "$deb" ] || continue
+                reprepro -Vb apt-repo -C main -A ${arch} includedeb ${codename} "$deb"
+              done
+            done
+          done
 
           echo "--- Repository structure ---"
           find apt-repo -type f | sort
@@ -284,7 +585,7 @@ jobs:
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
 
   release:
-    needs: build
+    needs: [build, build-i386]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -313,6 +614,8 @@ jobs:
           ls -lh artifacts/
 
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            [[ $DRAFT = true ]] && exit 0
+
             echo "Release $TAG already exists - uploading files"
             gh release upload "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
