@@ -514,7 +514,7 @@ jobs:
       pages: write
       id-token: write
     environment:
-      name: github-pages
+      name: apt-repository
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout repository
